@@ -183,214 +183,203 @@ def load_file(uploaded_file) -> pd.DataFrame:
     return df
 
 
-def multi_filter(label: str, df: pd.DataFrame, col: Optional[str]):
+@st.cache_data(show_spinner=False)
+def load_multisheet_file(uploaded_file) -> pd.DataFrame:
+    raw = uploaded_file.read()
+    xls = pd.ExcelFile(io.BytesIO(raw), engine="openpyxl")
+    dfs = []
+    for sheet in xls.sheet_names:
+        df_sheet = pd.read_excel(xls, sheet_name=sheet)
+        df_sheet["HOJA"] = str(sheet)
+        dfs.append(df_sheet)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    df = pd.concat(dfs, ignore_index=True)
+    df.columns = [normalize_col(c) for c in df.columns]
+
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].astype(str).str.strip()
+            df.loc[df[col].isin(["nan", "NaN", "None", ""]), col] = pd.NA
+
+    for col in df.columns:
+        if col.startswith("FEC") or "FECHA" in col:
+            df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+
+    return df
+
+def multi_filter(label: str, df: pd.DataFrame, col: Optional[str], container, key: str):
     if not col:
         return None
-
-    values = (
-        df[col]
-        .dropna()
-        .astype(str)
-        .sort_values()
-        .unique()
-        .tolist()
-    )
-
-    return st.sidebar.multiselect(
+    values = df[col].dropna().astype(str).sort_values().unique().tolist()
+    return container.multiselect(
         label,
         options=values,
         default=[],
-        placeholder=f"Todas las opciones de {label.lower()}",
+        placeholder=f"Todas las opciones",
+        key=key
     )
-
 
 def apply_text_filter(df: pd.DataFrame, search_text: str) -> pd.DataFrame:
     if not search_text.strip():
         return df
-
     text = search_text.strip().lower()
     mask = pd.Series(False, index=df.index)
-
     for col in df.columns:
         mask |= df[col].astype(str).str.lower().str.contains(text, na=False)
-
     return df[mask]
 
+def render_app_view(df: pd.DataFrame, prefix: str):
+    if df.empty:
+        st.warning("El archivo no tiene registros para mostrar.")
+        return
+
+    guide_col = find_column(df, GUIDE_CANDIDATES)
+    status_col = find_column(df, STATUS_CANDIDATES)
+    population_col = find_column(df, POPULATION_CANDIDATES)
+    city_col = find_column(df, CITY_CANDIDATES)
+    customer_col = find_column(df, CUSTOMER_CANDIDATES)
+    date_col = find_column(df, DATE_CANDIDATES)
+    value_col = find_column(df, VALUE_CANDIDATES)
+    weight_col = find_column(df, WEIGHT_CANDIDATES)
+    units_col = find_column(df, UNITS_CANDIDATES)
+
+    st.markdown("### Filtros")
+    hoja_col = "HOJA" if "HOJA" in df.columns else None
+
+    row1 = st.columns(4)
+    population_filter = multi_filter("Población / zona", df, population_col, row1[0], f"{prefix}_pop")
+    city_filter = multi_filter("Ciudad origen", df, city_col, row1[1], f"{prefix}_city")
+    status_filter = multi_filter("Estado", df, status_col, row1[2], f"{prefix}_status")
+    customer_filter = multi_filter("Cliente / remitente", df, customer_col, row1[3], f"{prefix}_cust")
+
+    row2 = st.columns(2)
+    hoja_filter = None
+    if hoja_col:
+        hoja_filter = multi_filter("Fecha cierre (Hoja)", df, hoja_col, row2[0], f"{prefix}_hoja")
+
+    search_text = row2[1 if hoja_col else 0].text_input("Buscar guía, destinatario, dirección, etc.", placeholder="Ej: 123456, Pérez...", key=f"{prefix}_search")
+
+    filtered = df.copy()
+
+    if population_col and population_filter:
+        filtered = filtered[filtered[population_col].astype(str).isin(population_filter)]
+    if city_col and city_filter:
+        filtered = filtered[filtered[city_col].astype(str).isin(city_filter)]
+    if status_col and status_filter:
+        filtered = filtered[filtered[status_col].astype(str).isin(status_filter)]
+    if customer_col and customer_filter:
+        filtered = filtered[filtered[customer_col].astype(str).isin(customer_filter)]
+    if hoja_col and hoja_filter:
+        filtered = filtered[filtered[hoja_col].astype(str).isin(hoja_filter)]
+
+    filtered = apply_text_filter(filtered, search_text)
+
+    st.markdown("### KPIs")
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    total_guides = filtered[guide_col].nunique() if guide_col else len(filtered)
+    kpi1.metric("Guías", f"{total_guides:,.0f}".replace(",", "."))
+
+    if units_col and pd.api.types.is_numeric_dtype(filtered[units_col]):
+        kpi2.metric("Unidades", f"{filtered[units_col].sum():,.0f}".replace(",", "."))
+    else:
+        kpi2.metric("Registros", f"{len(filtered):,.0f}".replace(",", "."))
+
+    if weight_col and pd.api.types.is_numeric_dtype(filtered[weight_col]):
+        kpi3.metric("Peso cobrado", f"{filtered[weight_col].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    else:
+        kpi3.metric("Estados", filtered[status_col].nunique() if status_col else "N/D")
+
+    if value_col and pd.api.types.is_numeric_dtype(filtered[value_col]):
+        kpi4.metric("Valor total", f"$ {filtered[value_col].sum():,.0f}".replace(",", "."))
+    else:
+        kpi4.metric("Poblaciones", filtered[population_col].nunique() if population_col else "N/D")
+
+    st.divider()
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Guías por estado")
+        if status_col:
+            status_chart = filtered[status_col].fillna("SIN ESTADO").astype(str).value_counts().reset_index()
+            status_chart.columns = ["Estado", "Cantidad"]
+            st.bar_chart(status_chart, x="Estado", y="Cantidad")
+        else:
+            st.warning("No encontré una columna de estado.")
+
+    with right:
+        st.subheader("Guías por población / zona")
+        if population_col:
+            population_chart = filtered[population_col].fillna("SIN POBLACIÓN").astype(str).value_counts().head(20).reset_index()
+            population_chart.columns = ["Población / zona", "Cantidad"]
+            st.bar_chart(population_chart, x="Población / zona", y="Cantidad")
+        else:
+            st.warning("No encontré una columna de población/zona.")
+
+    st.divider()
+    st.subheader("Detalle de guías")
+
+    priority_columns = [
+        "HOJA" if "HOJA" in filtered.columns else None,
+        guide_col,
+        status_col,
+        population_col,
+        city_col,
+        "DESTINATARIO" if "DESTINATARIO" in filtered.columns else None,
+        "DIRECCION" if "DIRECCION" in filtered.columns else None,
+    ]
+
+    preferred_columns = []
+    for col in priority_columns:
+        if col and col in filtered.columns and col not in preferred_columns:
+            preferred_columns.append(col)
+
+    for col in filtered.columns:
+        if col not in preferred_columns:
+            preferred_columns.append(col)
+
+    st.dataframe(filtered[preferred_columns], use_container_width=True, hide_index=True)
+
+    csv = filtered.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Descargar resultado",
+        data=csv,
+        file_name=f"guias_filtradas_{prefix}.csv",
+        mime="text/csv",
+        key=f"{prefix}_download"
+    )
+
+    with st.expander("Columnas detectadas"):
+        st.write({
+            "guía": guide_col, "estado": status_col, "población/zona": population_col,
+            "ciudad origen": city_col, "cliente/remitente": customer_col, "fecha": date_col,
+            "valor": value_col, "peso": weight_col, "unidades": units_col,
+            "multifecha (hoja)": hoja_col
+        })
 
 st.title("📦 Dashboard de guías y estados")
-st.caption("Sube tu archivo Excel para filtrar por población, ciudad, cliente y estado.")
 
-uploaded_file = st.file_uploader(
-    "Archivo Excel",
-    type=["xls", "xlsx", "html"],
-    help="Acepta .xlsx, .xls real y .xls exportado como HTML.",
-)
+tab1, tab2 = st.tabs(["Dashboard General", "Cierres Multifecha"])
 
-if uploaded_file is None:
-    st.info("Sube un archivo para iniciar el dashboard.")
-    st.stop()
+with tab1:
+    st.caption("Sube tu archivo (ej. data.xls)")
+    uploaded_file_1 = st.file_uploader("Archivo General", type=["xls", "xlsx", "html"], key="file1")
+    if uploaded_file_1:
+        try:
+            df1 = load_file(uploaded_file_1)
+            render_app_view(df1, prefix="tab1")
+        except Exception as exc:
+            st.error("No pude leer el archivo.")
+            st.exception(exc)
 
-try:
-    df = load_file(uploaded_file)
-except Exception as exc:
-    st.error("No pude leer el archivo.")
-    st.exception(exc)
-    st.stop()
-
-if df.empty:
-    st.warning("El archivo no tiene registros para mostrar.")
-    st.stop()
-
-guide_col = find_column(df, GUIDE_CANDIDATES)
-status_col = find_column(df, STATUS_CANDIDATES)
-population_col = find_column(df, POPULATION_CANDIDATES)
-city_col = find_column(df, CITY_CANDIDATES)
-customer_col = find_column(df, CUSTOMER_CANDIDATES)
-date_col = find_column(df, DATE_CANDIDATES)
-value_col = find_column(df, VALUE_CANDIDATES)
-weight_col = find_column(df, WEIGHT_CANDIDATES)
-units_col = find_column(df, UNITS_CANDIDATES)
-
-st.sidebar.header("Filtros")
-
-population_filter = multi_filter("Población / zona", df, population_col)
-city_filter = multi_filter("Ciudad origen", df, city_col)
-status_filter = multi_filter("Estado", df, status_col)
-customer_filter = multi_filter("Cliente / remitente", df, customer_col)
-
-search_text = st.sidebar.text_input(
-    "Buscar guía, destinatario, dirección, etc.",
-    placeholder="Ej: 123456, Pérez, Calle 10...",
-)
-
-filtered = df.copy()
-
-if population_col and population_filter:
-    filtered = filtered[filtered[population_col].astype(str).isin(population_filter)]
-
-if city_col and city_filter:
-    filtered = filtered[filtered[city_col].astype(str).isin(city_filter)]
-
-if status_col and status_filter:
-    filtered = filtered[filtered[status_col].astype(str).isin(status_filter)]
-
-if customer_col and customer_filter:
-    filtered = filtered[filtered[customer_col].astype(str).isin(customer_filter)]
-
-filtered = apply_text_filter(filtered, search_text)
-
-# KPIs
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-
-total_guides = filtered[guide_col].nunique() if guide_col else len(filtered)
-kpi1.metric("Guías", f"{total_guides:,.0f}".replace(",", "."))
-
-if units_col and pd.api.types.is_numeric_dtype(filtered[units_col]):
-    kpi2.metric("Unidades", f"{filtered[units_col].sum():,.0f}".replace(",", "."))
-else:
-    kpi2.metric("Registros", f"{len(filtered):,.0f}".replace(",", "."))
-
-if weight_col and pd.api.types.is_numeric_dtype(filtered[weight_col]):
-    kpi3.metric("Peso cobrado", f"{filtered[weight_col].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-else:
-    kpi3.metric("Estados", filtered[status_col].nunique() if status_col else "N/D")
-
-if value_col and pd.api.types.is_numeric_dtype(filtered[value_col]):
-    kpi4.metric("Valor total", f"$ {filtered[value_col].sum():,.0f}".replace(",", "."))
-else:
-    kpi4.metric("Poblaciones", filtered[population_col].nunique() if population_col else "N/D")
-
-st.divider()
-
-left, right = st.columns(2)
-
-with left:
-    st.subheader("Guías por estado")
-    if status_col:
-        status_chart = (
-            filtered[status_col]
-            .fillna("SIN ESTADO")
-            .astype(str)
-            .value_counts()
-            .reset_index()
-        )
-        status_chart.columns = ["Estado", "Cantidad"]
-        st.bar_chart(status_chart, x="Estado", y="Cantidad")
-    else:
-        st.warning("No encontré una columna de estado.")
-
-with right:
-    st.subheader("Guías por población / zona")
-    if population_col:
-        population_chart = (
-            filtered[population_col]
-            .fillna("SIN POBLACIÓN")
-            .astype(str)
-            .value_counts()
-            .head(20)
-            .reset_index()
-        )
-        population_chart.columns = ["Población / zona", "Cantidad"]
-        st.bar_chart(population_chart, x="Población / zona", y="Cantidad")
-    else:
-        st.warning("No encontré una columna de población/zona.")
-
-st.divider()
-
-st.subheader("Detalle de guías")
-
-# Orden solicitado para el detalle:
-# 1. STR_REM_NUMERO
-# 2. ESTADO
-# 3. STR_CIU_ZONA
-# 4. CIUDAD_ORIGEN
-# 5. DESTINATARIO
-# 6. DIRECCION
-# 7. Resto de columnas
-priority_columns = [
-    guide_col,
-    status_col,
-    population_col,
-    city_col,
-    "DESTINATARIO" if "DESTINATARIO" in filtered.columns else None,
-    "DIRECCION" if "DIRECCION" in filtered.columns else None,
-]
-
-preferred_columns = []
-for col in priority_columns:
-    if col and col in filtered.columns and col not in preferred_columns:
-        preferred_columns.append(col)
-
-for col in filtered.columns:
-    if col not in preferred_columns:
-        preferred_columns.append(col)
-
-st.dataframe(
-    filtered[preferred_columns],
-    use_container_width=True,
-    hide_index=True,
-)
-
-csv = filtered.to_csv(index=False).encode("utf-8-sig")
-st.download_button(
-    "Descargar resultado filtrado en CSV",
-    data=csv,
-    file_name="guias_filtradas.csv",
-    mime="text/csv",
-)
-
-with st.expander("Columnas detectadas"):
-    st.write(
-        {
-            "guía": guide_col,
-            "estado": status_col,
-            "población/zona": population_col,
-            "ciudad origen": city_col,
-            "cliente/remitente": customer_col,
-            "fecha": date_col,
-            "valor": value_col,
-            "peso": weight_col,
-            "unidades": units_col,
-        }
-    )
-    st.dataframe(pd.DataFrame({"columnas": df.columns}), use_container_width=True, hide_index=True)
+with tab2:
+    st.caption("Sube el archivo de fechas múltiples (ej. cierre_manizales.xlsx)")
+    uploaded_file_2 = st.file_uploader("Archivo Excel (Cierres)", type=["xlsx", "xls"], key="file2")
+    if uploaded_file_2:
+        try:
+            df2 = load_multisheet_file(uploaded_file_2)
+            render_app_view(df2, prefix="tab2")
+        except Exception as exc:
+            st.error("No pude leer el archivo multifecha.")
+            st.exception(exc)
